@@ -1,4 +1,5 @@
 import re
+from random import randint
 
 from .utils import _perform_request, format_datetime, format_utc, markdown_table_row
 
@@ -62,19 +63,30 @@ class Issue(object):
         validate_user(bugzilla_fields["assigned_to"])
         self.load_fields(bugzilla_fields)
 
+    def get_label_list(self,fields):
+        ll = []
+        ll.append(fields.get("product"))
+        ll.append(fields.get("bug_status"))
+        ll.append(fields.get("cf_report_type"))
+        ll.append(fields.get("resolution"))
+        
+        return [l for l in ll if l and l != '---']
+
+
     def load_fields(self, fields):
         self.title = fields["short_desc"]
         self.sudo = conf.gitlab_users[conf.bugzilla_users[fields["reporter"]]]
         self.assignee_ids = [conf.gitlab_users[conf.bugzilla_users[fields["assigned_to"]]]]
         self.created_at = format_utc(fields["creation_ts"])
         self.status = fields["bug_status"]
-        self.create_labels(fields["component"], fields.get("op_sys"), fields.get("keywords"))
+        # get label list
+        self.create_labels(fields["component"], fields.get("op_sys"), fields.get("keywords"), extra_labels=self.get_label_list(fields))
         milestone = fields["target_milestone"]
         if conf.map_milestones and milestone not in conf.milestones_to_skip:
             self.create_milestone(milestone)
         self.create_description(fields)
 
-    def create_labels(self, component, operating_system, keywords):
+    def create_labels(self, component, operating_system, keywords, extra_labels=[]):
         '''
         Creates 4 types of labels: default labels listed in the configuration, component labels,
         operating system labels, and keyword labels.
@@ -97,6 +109,28 @@ class Issue(object):
             for k in keywords.replace(" ", "").split(","):
                 if not (conf.keywords_to_skip and k in conf.keywords_to_skip):
                     labels.append(k)
+        
+        if len(extra_labels) > 0:
+            for l in extra_labels:
+                labels.append(l)
+            
+
+        # create labels in project if they do not yet exist
+        url = "{}/projects/{}/labels".format(conf.gitlab_base_url, conf.gitlab_project_id)
+        params = {"per_page":90}
+        result = _perform_request(
+            url, "get", headers=self.headers, params=params)
+        existing_labels = [l["name"] for l in result]
+        url = "{}/projects/{}/labels".format(conf.gitlab_base_url, conf.gitlab_project_id)
+        for l in labels:
+            if l:
+                if l not in existing_labels:
+                    label_data = {
+                    'name':l,
+                    'color':'#{:06x}'.format(randint(0, 256**3))
+                    }
+                    result = _perform_request(
+                        url, "post", headers=self.headers, data=label_data,sudo=False)
 
         self.labels = ",".join(labels)
 
@@ -107,9 +141,8 @@ class Issue(object):
         if milestone not in conf.gitlab_milestones:
             url = "{}/projects/{}/milestones".format(conf.gitlab_base_url, conf.gitlab_project_id)
             response = _perform_request(
-                url, "post", headers=self.headers, data={"title": milestone})
+                url, "post", headers=self.headers, data={"title": milestone},sudo=False)
             conf.gitlab_milestones[milestone] = response["id"]
-
         self.milestone_id = conf.gitlab_milestones[milestone]
 
     def create_description(self, fields):
@@ -126,20 +159,33 @@ class Issue(object):
             bug_id = fields["bug_id"]
             link = "{}/show_bug.cgi?id={}".format(conf.bugzilla_base_url, bug_id)
             self.description += markdown_table_row("Bugzilla Link",
-                                                   "[{}]({})".format(bug_id, link))
+                                                   '[{}]({})'.format(bug_id, link))
 
         formatted_dt = format_datetime(fields["creation_ts"], conf.datetime_format_string)
         self.description += markdown_table_row("Created on", formatted_dt)
+        self.description += markdown_table_row("Affected Version", fields.get("version"))
 
-        if fields.get("resolution"):
-            self.description += markdown_table_row("Resolution", fields["resolution"])
-            self.description += markdown_table_row("Resolved on",
-                                                   format_datetime(fields["delta_ts"],
-                                                                   conf.datetime_format_string))
+        if 'dependson' in fields:
+            dependencies = []
+            depends = fields.get("dependson")
+            s = []
+            for d in depends:
+                link = "{}/show_bug.cgi?id={}".format(conf.bugzilla_base_url, d)
+                s.append('[{}]({})'.format(d, link))
+            self.description += markdown_table_row("Depends on", " ,".join(s))
 
-        self.description += markdown_table_row("Version", fields.get("version"))
-        self.description += markdown_table_row("OS", fields.get("op_sys"))
-        self.description += markdown_table_row("Architecture", fields.get("rep_platform"))
+        if 'blocked' in fields:
+            blocked = fields.get("blocked")
+            s = []
+            for d in blocked:
+                link = "{}/show_bug.cgi?id={}".format(conf.bugzilla_base_url, d)
+                s.append('[{}]({})'.format(d, link))
+            self.description += markdown_table_row("Blocks", " ,".join(s))
+        
+        self.description += markdown_table_row("Solution Designer", fields.get("cf_proposal_designer"))
+        self.description += markdown_table_row("Solution", fields.get("cf_proposedsolution"))
+
+
 
         # add first comment to the issue description
         attachments = []
@@ -200,13 +246,27 @@ class Issue(object):
 
     def save(self):
         self.validate()
+        # For a user to be able to properly create issues in the migration
+        # they must be project owner - to do this we add them to the parent group
+        # as owner for the save, then remove them after
+        url = "{}/projects/{}".format(conf.gitlab_base_url, conf.gitlab_project_id)
+        # first get the group id
+        response = _perform_request(url, "get", headers=self.headers,json=True,
+                                    dry_run=conf.dry_run,sudo=False)
+        group_id = response["namespace"]["id"]
+        ##then add user as owner to group
+        sudo_data = {"user_id":self.sudo, "access_level":50}
+        url = "{}/groups/{}/members".format(conf.gitlab_base_url, group_id)
+        response = _perform_request(url, "post", headers=self.headers, data=sudo_data, json=True,
+                                    dry_run=conf.dry_run,sudo=False)
+
+        ##
+        self.headers["sudo"] = self.sudo
         url = "{}/projects/{}/issues".format(conf.gitlab_base_url, conf.gitlab_project_id)
         data = {k: v for k, v in self.__dict__.items() if k in self.data_fields}
-        self.headers["sudo"] = self.sudo
-
         response = _perform_request(url, "post", headers=self.headers, data=data, json=True,
                                     dry_run=conf.dry_run)
-
+        
         if conf.dry_run:
             # assign a random number so that program can continue
             self.id = 5
@@ -214,15 +274,34 @@ class Issue(object):
 
         self.id = response["iid"]
 
+        # then remove the user from the group again...
+        url = "{}/groups/{}/members/{}".format(conf.gitlab_base_url, group_id,self.sudo)
+        response = _perform_request(url, "delete", headers=self.headers,json=False,sudo=False)
+
     def close(self):
+
+        # first get the group id
+        url = "{}/projects/{}".format(conf.gitlab_base_url, conf.gitlab_project_id)
+        response = _perform_request(url, "get", headers=self.headers,json=True,
+                                    dry_run=conf.dry_run,sudo=False)
+        group_id = response["namespace"]["id"]
+        ##then add user as owner to group
+        sudo_data = {"user_id":self.sudo, "access_level":50}
+        url = "{}/groups/{}/members".format(conf.gitlab_base_url, group_id)
+        response = _perform_request(url, "post", headers=self.headers, data=sudo_data, json=True,
+                                    dry_run=conf.dry_run,sudo=False)
+        
         url = "{}/projects/{}/issues/{}".format(conf.gitlab_base_url, conf.gitlab_project_id,
                                                 self.id)
         data = {
             "state_event": "close",
         }
         self.headers["sudo"] = self.sudo
-
         _perform_request(url, "put", headers=self.headers, data=data, dry_run=conf.dry_run)
+
+        # then remove the user from the group again...
+        url = "{}/groups/{}/members/{}".format(conf.gitlab_base_url, group_id,self.sudo)
+        response = _perform_request(url, "delete", headers=self.headers,json=False,sudo=False)
 
 
 class Comment(object):
@@ -268,12 +347,15 @@ class Comment(object):
     def save(self):
         self.validate()
         self.headers["sudo"] = self.sudo
+
+
+       
         url = "{}/projects/{}/issues/{}/notes".format(conf.gitlab_base_url, conf.gitlab_project_id,
                                                       self.issue_id)
         data = {k: v for k, v in self.__dict__.items() if k in self.data_fields}
-
         _perform_request(url, "post", headers=self.headers, data=data, json=True,
                          dry_run=conf.dry_run)
+
 
 
 class Attachment(object):

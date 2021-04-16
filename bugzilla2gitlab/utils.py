@@ -9,7 +9,7 @@ session = None
 
 
 def _perform_request(url, method, data={}, params={}, headers={}, files={}, json=True,
-                     dry_run=False):
+                     dry_run=False, sudo=True):
     '''
     Utility method to perform an HTTP request.
     '''
@@ -23,19 +23,25 @@ def _perform_request(url, method, data={}, params={}, headers={}, files={}, json
         session = requests.Session()
 
     func = getattr(session, method)
-
+    
+    if not sudo:
+        if "sudo" in headers:
+            s = headers.pop('sudo')
+        
     if files:
         result = func(url, files=files, headers=headers)
     else:
         result = func(url, params=params, data=data, headers=headers)
 
-    if result.status_code in [200, 201]:
+    
+
+    if result.status_code in [200, 201, 204]:
         if json:
             return result.json()
         else:
             return result
 
-    raise Exception("{} failed requests: {}".format(result.status_code, result.reason))
+    raise Exception("{} failed requests: {} \nurl: {} \ndata: {}\nheaders: {}".format(result.status_code, result.reason, url, data,headers))
 
 
 def markdown_table_row(key, value):
@@ -73,6 +79,8 @@ def get_bugzilla_bug(bugzilla_url, bug_id):
         "long_desc": [],
         "attachment": [],
         "cc": [],
+        "dependson": [],
+        "blocked": [],
     }
     for bug in tree:
         for field in bug:
@@ -81,7 +89,7 @@ def get_bugzilla_bug(bugzilla_url, bug_id):
                 for data in field:
                     new[data.tag] = data.text
                 bug_fields[field.tag].append(new)
-            elif field.tag == "cc":
+            elif field.tag in ("dependson", "blocked", "cc"):
                 bug_fields[field.tag].append(field.text)
             else:
                 bug_fields[field.tag] = field.text
@@ -110,8 +118,9 @@ def bugzilla_login(url, user):
             headers={'Referer': login_url},
             data={
                 'Bugzilla_login': user,
-                'Bugzilla_password': getpass("Bugzilla password for {}: ".format(user))},
+                'Bugzilla_password': "t4e7eYqdW4MC3Yf"},
             json=False)
+                #'Bugzilla_password': getpass("Bugzilla password for {}: ".format(user))},
         if response.cookies:
             break
         else:

@@ -25,3 +25,5 @@ class Migrator(object):
         fields = get_bugzilla_bug(self.conf.bugzilla_base_url, bugzilla_bug_id)
         issue_thread = IssueThread(self.conf, fields)
         issue_thread.save()
+        issue_url = "{}/projects/{}/issues/{}".format(self.conf.gitlab_base_url, self.conf.gitlab_project_id,issue_thread.issue.id)
+        print("Gitlab: #{} // {}".format(issue_thread.issue.id,issue_url))
